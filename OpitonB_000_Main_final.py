@@ -1,5 +1,6 @@
 import os
 import json
+import sys
 import time
 import threading
 from dataclasses import dataclass, asdict, field
@@ -16,6 +17,10 @@ import pygame
 
 import importlib.util
 
+NLTK_FALLBACK = os.path.join(getattr(sys, "_MEIPASS", os.getcwd()), "nltk_data")
+if os.path.isdir(NLTK_FALLBACK) and NLTK_FALLBACK not in nltk.data.path:
+    nltk.data.path.insert(0, NLTK_FALLBACK)
+
 API_PATH = os.path.join(os.path.dirname(__file__), "OptionB_api_module.py")
 _spec = importlib.util.spec_from_file_location("api_module", API_PATH)
 api = importlib.util.module_from_spec(_spec)
@@ -26,6 +31,9 @@ DEFAULT_FONT_SIZE = 18
 MIN_FONT, MAX_FONT = 12, 36
 
 HIGHLIGHT_COLOR = "#fff7ad"
+LEMMA_CELL_COLOR = "#5dade2"
+CONTEXT_CELL_COLOR = "#ffe082"
+TREE_HIGHLIGHT_TIMEOUT_MS = 1800
 THEMES = {
     "light": {"text_fg": "#222222", "text_bg": "#ffffff", "sel_bg": "#5dade2"},
     "dark": {"text_fg": "#e6e6e6", "text_bg": "#1f1f1f", "sel_bg": "#5dade2"},
@@ -55,6 +63,260 @@ class WordEntry:
     surface: str = ""
 
 
+class TextHighlightManager:
+    """Manage highlight tags and numbering widgets for a ``tk.Text`` widget."""
+
+    def __init__(self, widget: tk.Text, *, prefix: str, tag: str = "word_highlight"):
+        self.widget = widget
+        self.prefix = prefix
+        self.tag = tag
+        self._marks: Dict[str, Dict[str, str]] = {}
+        self._number_widgets: Dict[str, Dict[str, object]] = {}
+
+    def clear_all(self):
+        for key in list(self._marks.keys()):
+            self.remove(key)
+        self._marks.clear()
+        for key in list(self._number_widgets.keys()):
+            self._remove_number_widget(key)
+        self._number_widgets.clear()
+
+    def apply(self, key: str, start: str, end: str):
+        self.remove(key)
+        self.widget.tag_add(self.tag, start, end)
+        start_mark = f"{self.prefix}_start_{key}"
+        end_mark = f"{self.prefix}_end_{key}"
+        self.widget.mark_set(start_mark, start)
+        self.widget.mark_set(end_mark, end)
+        self.widget.mark_gravity(start_mark, tk.LEFT)
+        self.widget.mark_gravity(end_mark, tk.LEFT)
+        self._marks[key] = {"start": start_mark, "end": end_mark}
+
+        number_mark = f"{self.prefix}_number_{key}"
+        self.widget.mark_set(number_mark, start)
+        self.widget.mark_gravity(number_mark, tk.LEFT)
+        bundle = self._create_number_widget()
+        self.widget.window_create(number_mark, window=bundle["frame"], align="top")
+        bundle["mark"] = number_mark
+        self._number_widgets[key] = bundle
+        self._style_number_widget(bundle)
+
+    def remove(self, key: str):
+        marks = self._marks.pop(key, None)
+        if marks:
+            self.widget.tag_remove(self.tag, marks["start"], marks["end"])
+            self.widget.mark_unset(marks["start"])
+            self.widget.mark_unset(marks["end"])
+        self._remove_number_widget(key)
+
+    def refresh_styles(self):
+        for bundle in self._number_widgets.values():
+            self._style_number_widget(bundle)
+
+    def update_numbers(self, order_map: Dict[str, int]):
+        for key, bundle in self._number_widgets.items():
+            label: tk.Label = bundle["label"]  # type: ignore[assignment]
+            number = order_map.get(key, "")
+            label.config(text=str(number) if number else "")
+            self._style_number_widget(bundle)
+
+    def _create_number_widget(self) -> Dict[str, object]:
+        frame = tk.Frame(self.widget, bg=HIGHLIGHT_COLOR, highlightthickness=0, bd=0)
+        label = tk.Label(
+            frame,
+            text="",
+            bg=HIGHLIGHT_COLOR,
+            fg="#000000",
+            padx=0,
+            pady=0,
+            anchor="nw",
+        )
+        label.place(x=0, y=0, anchor="nw")
+        return {"frame": frame, "label": label, "widget": self.widget}
+
+    def _remove_number_widget(self, key: str):
+        bundle = self._number_widgets.pop(key, None)
+        if not bundle:
+            return
+        mark = bundle.get("mark")
+        if mark:
+            try:
+                self.widget.delete(mark)
+            except tk.TclError:
+                pass
+            self.widget.mark_unset(mark)
+        frame = bundle.get("frame")
+        if isinstance(frame, tk.Widget):
+            frame.destroy()
+
+    def _style_number_widget(self, bundle: Dict[str, object]):
+        widget: tk.Text = bundle["widget"]  # type: ignore[assignment]
+        frame: tk.Frame = bundle["frame"]  # type: ignore[assignment]
+        label: tk.Label = bundle["label"]  # type: ignore[assignment]
+        text_font = tkfont.Font(font=widget["font"])
+        line_height = text_font.metrics("linespace")
+        base_size = abs(int(text_font.cget("size") or 0)) or DEFAULT_FONT_SIZE
+        number_font_size = max(8, int(base_size / 3))
+        label.config(font=("Segoe UI", number_font_size, "bold"))
+        width = max(12, text_font.measure("0") + 2)
+        frame.config(width=width, height=line_height, bg=HIGHLIGHT_COLOR)
+        label.config(bg=HIGHLIGHT_COLOR)
+        frame.pack_propagate(False)
+
+
+class TreeHighlightController:
+    """Handle per-cell highlighting for the word list treeview."""
+
+    def __init__(self, app: tk.Tk, tree: ttk.Treeview):
+        self.app = app
+        self.tree = tree
+        self._cell_tag_supported: bool | None = None
+        self._cell_tags: Dict[Tuple[str, str], str] = {}
+        self._active_item: str | None = None
+        self._active_tag: str | None = None
+        self._active_column: str | None = None
+        self._highlight_after: str | None = None
+        self._auto_clear = False
+        self._started_at = 0.0
+        self._colors = THEMES["light"]
+
+    @property
+    def active_item(self) -> str | None:
+        return self._active_item
+
+    def set_theme(self, colors: Dict[str, str]):
+        self._colors = colors
+        self.update_styles()
+
+    def apply(self, item: str, column: str, color: str, *, auto_clear: bool = False):
+        column_name = self._resolve_column(column)
+        if not column_name or not self.tree.exists(item):
+            self.clear()
+            return
+        tag = self._ensure_tag(column_name, color)
+        if self._active_item == item and self._active_tag == tag:
+            self._auto_clear = auto_clear
+            if auto_clear:
+                self._started_at = time.monotonic()
+                self._schedule_clear()
+            else:
+                self._started_at = 0.0
+                self._cancel_after()
+            return
+        self.clear()
+        tags = list(self.tree.item(item, "tags") or [])
+        if tag not in tags:
+            tags.append(tag)
+        self.tree.item(item, tags=tuple(tags))
+        self._active_item = item
+        self._active_tag = tag
+        self._active_column = column_name
+        self._auto_clear = auto_clear
+        if auto_clear:
+            self._started_at = time.monotonic()
+            self._schedule_clear()
+        else:
+            self._started_at = 0.0
+            self._cancel_after()
+
+    def clear(self):
+        self._cancel_after()
+        if self._active_item and self._active_tag and self.tree.exists(self._active_item):
+            tags = list(self.tree.item(self._active_item, "tags") or [])
+            if self._active_tag in tags:
+                tags.remove(self._active_tag)
+                self.tree.item(self._active_item, tags=tuple(tags))
+        self._active_item = None
+        self._active_tag = None
+        self._active_column = None
+        self._auto_clear = False
+        self._started_at = 0.0
+
+    def update_styles(self):
+        for (column_name, color), tag in self._cell_tags.items():
+            self._configure_tag(column_name, color, tag)
+        if self._active_item and self._active_column and self._active_tag:
+            item = self._active_item
+            column = self._active_column
+            color = self._current_color()
+            auto_clear = self._auto_clear
+            self._active_item = None
+            self._active_tag = None
+            self._active_column = None
+            self.apply(item, column, color, auto_clear=auto_clear)
+
+    def _resolve_column(self, column: str) -> str:
+        columns = list(self.tree["columns"])
+        if column in columns:
+            return column
+        if column.startswith("#"):
+            try:
+                index = int(column[1:]) - 1
+            except ValueError:
+                return ""
+            if 0 <= index < len(columns):
+                return columns[index]
+        return ""
+
+    def _ensure_tag(self, column_name: str, color: str) -> str:
+        key = (column_name, color)
+        tag = self._cell_tags.get(key)
+        if tag:
+            self._configure_tag(column_name, color, tag)
+            return tag
+        tag = f"tree_highlight_{len(self._cell_tags)}"
+        self._cell_tags[key] = tag
+        self._configure_tag(column_name, color, tag)
+        return tag
+
+    def _configure_tag(self, column_name: str, bg_color: str, tag: str):
+        text_color = self._colors["text_fg"]
+        if self._cell_tag_supported is False:
+            self.tree.tag_configure(tag, background=bg_color, foreground=text_color)
+            return
+        try:
+            self.tree.tk.call(self.tree, "tag", "configure", tag, "-cellbackground", column_name, bg_color)
+            self.tree.tk.call(self.tree, "tag", "configure", tag, "-cellforeground", column_name, text_color)
+            self._cell_tag_supported = True
+        except tk.TclError:
+            self._cell_tag_supported = False
+            self.tree.tag_configure(tag, background=bg_color, foreground=text_color)
+
+    def _current_color(self) -> str:
+        if not self._active_tag:
+            return LEMMA_CELL_COLOR
+        for (_column, color), tag in self._cell_tags.items():
+            if tag == self._active_tag:
+                return color
+        return LEMMA_CELL_COLOR
+
+    def _schedule_clear(self):
+        self._cancel_after()
+        if not self._active_item or not self._auto_clear:
+            return
+        timeout_seconds = TREE_HIGHLIGHT_TIMEOUT_MS / 1000.0
+
+        def _poll():
+            self._highlight_after = None
+            if not self._active_item or not self._auto_clear:
+                return
+            elapsed = time.monotonic() - self._started_at
+            if not pygame.mixer.get_busy() or elapsed >= timeout_seconds:
+                self.clear()
+                return
+            self._schedule_clear()
+
+        self._highlight_after = self.app.after(120, _poll)
+
+    def _cancel_after(self):
+        if self._highlight_after:
+            try:
+                self.app.after_cancel(self._highlight_after)
+            except tk.TclError:
+                pass
+            self._highlight_after = None
+
+
 class VocabReaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -74,10 +336,9 @@ class VocabReaderApp(tk.Tk):
         self._reading_pause = threading.Event()
         self._reading_mode = None
         self.lemmatizer = WordNetLemmatizer()
-        self.entry_marks_en: Dict[str, Dict[str, str]] = {}
-        self.entry_marks_vi: Dict[str, Dict[str, str]] = {}
-        self.number_widgets_en: Dict[str, Dict[str, object]] = {}
-        self.number_widgets_vi: Dict[str, Dict[str, object]] = {}
+        self._suppress_lemma_speak = False
+        self._pending_context_item: str | None = None
+        self._suppress_reset_after: str | None = None
         self._build_ui()
         self._bind_keys()
         self._apply_theme()
@@ -152,11 +413,21 @@ class VocabReaderApp(tk.Tk):
         self.tree.column("POS", width=120, anchor="w")
         self.tree.column("Meaning (VI)", width=520, anchor="w")
         self.tree.pack(fill="both", expand=True)
+        self.tree_highlight = TreeHighlightController(self, self.tree)
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<ButtonPress-1>", self._on_tree_button_press)
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_button_release)
+        self.tree.bind("<Configure>", lambda _e: self.tree_highlight.update_styles())
+        self.tree.bind("<Map>", lambda _e: self.tree_highlight.update_styles())
+        self.tree.bind("<Unmap>", lambda _e: self.tree_highlight.clear())
+        self.tree.bind("<FocusOut>", lambda _e: self.tree_highlight.clear())
         dict_toolbar = ttk.Frame(self.tab_dict)
         dict_toolbar.pack(fill="x")
         ttk.Button(dict_toolbar, text="Phát âm", command=self.speak_selected_word).pack(side="left", padx=4, pady=4)
         ttk.Button(dict_toolbar, text="Xoá dòng", command=self.delete_selected_word).pack(side="left", padx=4)
         ttk.Button(dict_toolbar, text="Export TXT", command=self.action_export_txt).pack(side="left", padx=4)
+        self.highlight_en = TextHighlightManager(self.text_en, prefix="en")
+        self.highlight_vi = TextHighlightManager(self.text_vi, prefix="vi")
         self.text = self.text_en
 
     def _build_menubar(self):
@@ -201,7 +472,9 @@ class VocabReaderApp(tk.Tk):
                 selectbackground=colors["sel_bg"],
                 selectforeground="#000000",
             )
-        self._refresh_number_widgets()
+        self.highlight_en.refresh_styles()
+        self.highlight_vi.refresh_styles()
+        self.tree_highlight.set_theme(colors)
 
     def _configure_tree_style(self):
         if not hasattr(self, "style"):
@@ -211,6 +484,16 @@ class VocabReaderApp(tk.Tk):
         row_height = max(28, int(self.font_size * 1.6))
         self.style.configure("Treeview", font=body_font, rowheight=row_height)
         self.style.configure("Treeview.Heading", font=heading_font)
+
+    def _reset_session_state(self, *, clear_vi_text: bool = True):
+        self.entries.clear()
+        self.llm_cache.clear()
+        self.highlight_en.clear_all()
+        self.highlight_vi.clear_all()
+        self.tree.delete(*self.tree.get_children())
+        self.tree_highlight.clear()
+        if clear_vi_text:
+            self.text_vi.delete("1.0", "end")
 
     def action_open_txt(self):
         path = filedialog.askopenfilename(filetypes=[("UTF-8 Text", "*.txt"), ("All files", "*.*")])
@@ -222,15 +505,8 @@ class VocabReaderApp(tk.Tk):
         self.text_content = raw
         self._render_text_en(raw)
         self._build_sentence_offsets(raw)
-        self.entries.clear()
-        self.llm_cache.clear()
-        self.entry_marks_en.clear()
-        self.entry_marks_vi.clear()
-        self._clear_number_widgets(self.text_en, self.number_widgets_en)
-        self._clear_number_widgets(self.text_vi, self.number_widgets_vi)
-        self.tree.delete(*self.tree.get_children())
+        self._reset_session_state(clear_vi_text=True)
         self.title(f"{APP_TITLE} – {os.path.basename(path)}")
-        self.text_vi.delete("1.0", "end")
         self._clear_vietsub_state()
 
     def _render_text_en(self, content: str):
@@ -282,12 +558,7 @@ class VocabReaderApp(tk.Tk):
         self.text_vi.config(font=("Segoe UI", self.font_size))
         self._configure_tree_style()
         self._apply_theme()
-        self.entries.clear()
-        self.entry_marks_en.clear()
-        self.entry_marks_vi.clear()
-        self._clear_number_widgets(self.text_en, self.number_widgets_en)
-        self._clear_number_widgets(self.text_vi, self.number_widgets_vi)
-        self.tree.delete(*self.tree.get_children())
+        self._reset_session_state(clear_vi_text=True)
         for entry_data in data.get("entries", []):
             offsets = entry_data.get("offsets") or []
             converted: List[Dict] = []
@@ -326,6 +597,18 @@ class VocabReaderApp(tk.Tk):
             self.cm.tk_popup(event.x_root, event.y_root)
         finally:
             self.cm.grab_release()
+
+    def _get_selection_or_word(self) -> Tuple[str, str, str] | None:
+        try:
+            start = self.text_en.index("sel.first")
+            end = self.text_en.index("sel.last")
+        except tk.TclError:
+            start = self.text_en.index("insert wordstart")
+            end = self.text_en.index("insert wordend")
+        snippet = self.text_en.get(start, end).strip()
+        if not snippet:
+            return None
+        return start, end, snippet
 
     def mark_new_word(self):
         try:
@@ -373,16 +656,14 @@ class VocabReaderApp(tk.Tk):
             messagebox.showerror("TTS", str(exc))
 
     def speak_selection(self):
+        selection = self._get_selection_or_word()
+        if not selection:
+            return
+        _, _, snippet = selection
         try:
-            snippet = self.text_en.get("sel.first", "sel.last").strip()
-        except tk.TclError:
-            idx = self.text_en.index("insert wordstart")
-            snippet = self.text_en.get(idx, "insert wordend").strip()
-        if snippet:
-            try:
-                self.tts.speak(snippet)
-            except Exception as exc:
-                messagebox.showerror("TTS", str(exc))
+            self.tts.speak(snippet)
+        except Exception as exc:
+            messagebox.showerror("TTS", str(exc))
 
     def start_reading(self, mode: str):
         if self._reading_thread and self._reading_thread.is_alive():
@@ -413,18 +694,9 @@ class VocabReaderApp(tk.Tk):
                     self._wait_audio_or_pause()
                     self._clear_reading_highlight()
             elif self._reading_mode == "word":
-                try:
-                    snippet = self.text_en.get("sel.first", "sel.last").strip()
-                except tk.TclError:
-                    idx = self.text_en.index("insert wordstart")
-                    snippet = self.text_en.get(idx, "insert wordend").strip()
-                if snippet:
-                    try:
-                        start = self.text_en.index("sel.first")
-                        end = self.text_en.index("sel.last")
-                    except tk.TclError:
-                        start = self.text_en.index("insert wordstart")
-                        end = self.text_en.index("insert wordend")
+                selection = self._get_selection_or_word()
+                if selection:
+                    start, end, snippet = selection
                     self.text_en.tag_add("reading", start, end)
                     self.tts.speak(snippet)
                     self._wait_audio_or_pause()
@@ -469,7 +741,8 @@ class VocabReaderApp(tk.Tk):
         self.text_en.config(font=("Segoe UI", self.font_size))
         self.text_vi.config(font=("Segoe UI", self.font_size))
         self._configure_tree_style()
-        self._refresh_number_widgets()
+        self.highlight_en.refresh_styles()
+        self.highlight_vi.refresh_styles()
 
     def _find_paragraph(self, full_text: str, start: int, end: int) -> str:
         left = full_text.rfind("\n\n", 0, start)
@@ -638,11 +911,75 @@ class VocabReaderApp(tk.Tk):
         key = selection[0]
         entry = self.entries.get(key)
         if entry:
-            text = entry.surface or entry.display
-            try:
-                self.tts.speak(text)
-            except Exception as exc:
-                messagebox.showerror("TTS", str(exc))
+            self._speak_entry_text(entry, use_surface=True)
+
+    def _speak_entry_text(self, entry: WordEntry, *, use_surface: bool):
+        text = (entry.surface or "").strip() if use_surface else (entry.display or "").strip()
+        if not text:
+            text = (entry.display or entry.surface or "").strip()
+        if not text:
+            return
+        try:
+            self.tts.speak(text)
+        except Exception as exc:
+            messagebox.showerror("TTS", str(exc))
+
+    def _on_tree_select(self, _event):
+        selection = self.tree.selection()
+        if not selection:
+            self.tree_highlight.clear()
+            return
+        if self._suppress_lemma_speak:
+            return
+        key = selection[0]
+        entry = self.entries.get(key)
+        if entry:
+            self._speak_entry_text(entry, use_surface=False)
+            self.tree_highlight.apply(key, "Word", LEMMA_CELL_COLOR, auto_clear=True)
+
+    def _on_tree_button_press(self, event):
+        column = self.tree.identify_column(event.x)
+        row = self.tree.identify_row(event.y)
+        if column == "#1" and row:
+            self._suppress_lemma_speak = True
+            self._pending_context_item = row
+            if self._suppress_reset_after:
+                try:
+                    self.after_cancel(self._suppress_reset_after)
+                except tk.TclError:
+                    pass
+                self._suppress_reset_after = None
+        else:
+            self._suppress_lemma_speak = False
+            self._pending_context_item = None
+            if self._suppress_reset_after:
+                try:
+                    self.after_cancel(self._suppress_reset_after)
+                except tk.TclError:
+                    pass
+                self._suppress_reset_after = None
+            if not row:
+                self.tree_highlight.clear()
+
+    def _on_tree_button_release(self, _event):
+        if self._pending_context_item:
+            entry = self.entries.get(self._pending_context_item)
+            if entry:
+                self._speak_entry_text(entry, use_surface=True)
+                self.tree_highlight.apply(self._pending_context_item, "No.", CONTEXT_CELL_COLOR, auto_clear=True)
+            if self._suppress_reset_after:
+                try:
+                    self.after_cancel(self._suppress_reset_after)
+                except tk.TclError:
+                    pass
+            self._suppress_reset_after = self.after_idle(self._release_tree_suppress)
+        self._pending_context_item = None
+        if not self._suppress_reset_after:
+            self._suppress_lemma_speak = False
+
+    def _release_tree_suppress(self):
+        self._suppress_lemma_speak = False
+        self._suppress_reset_after = None
 
     def delete_selected_word(self):
         selection = self.tree.selection()
@@ -652,8 +989,10 @@ class VocabReaderApp(tk.Tk):
         entry = self.entries.pop(key, None)
         if not entry:
             return
-        self._remove_entry_highlight(key, entry)
+        self._remove_entry_highlight(key)
         self.tree.delete(key)
+        if key == self.tree_highlight.active_item:
+            self.tree_highlight.clear()
         self._update_vietsub_highlights()
         self._update_entry_numbers()
 
@@ -667,13 +1006,6 @@ class VocabReaderApp(tk.Tk):
         return sorted(self.entries.values(), key=key_fn)
 
     def _entry_key(self, word: str, sentence: str) -> str:
-        """Create a stable key for dictionary entries.
-
-        The key uses a normalized (lowercase) form of the display word together with
-        a hash of the context sentence. Using the hash keeps the key compact while
-        still differentiating the same word appearing in different contexts.
-        """
-
         return f"{word.lower()}|{abs(hash(sentence))}"
 
     def _refresh_tree_sorted(self):
@@ -682,6 +1014,7 @@ class VocabReaderApp(tk.Tk):
             key = self._entry_key(entry.display, entry.context_sentence)
             values = [index, entry.display, entry.pos, entry.vi_meaning]
             self.tree.insert("", "end", iid=key, values=values)
+        self.tree_highlight.clear()
 
     def _apply_entry_highlight(self, key: str, entry: WordEntry):
         full_text = self.text_en.get("1.0", "end-1c")
@@ -692,114 +1025,28 @@ class VocabReaderApp(tk.Tk):
         end_index = self._abs_to_index(data["abs_end"], full_text)
         surface = entry.surface or self.text_en.get(start_index, end_index)
         word_end = self.text_en.index(f"{start_index}+{len(surface)}c")
-        self.text_en.tag_add("word_highlight", start_index, word_end)
-        start_mark = f"start_{key}"
-        end_mark = f"end_{key}"
-        self.text_en.mark_set(start_mark, start_index)
-        self.text_en.mark_set(end_mark, word_end)
-        self.text_en.mark_gravity(start_mark, tk.LEFT)
-        self.text_en.mark_gravity(end_mark, tk.LEFT)
-        self.entry_marks_en[key] = {"start": start_mark, "end": end_mark}
-        number_mark = f"number_en_{key}"
-        self.text_en.mark_set(number_mark, start_index)
-        self.text_en.mark_gravity(number_mark, tk.LEFT)
-        widget = self._create_number_widget(self.text_en)
-        self.text_en.window_create(number_mark, window=widget["frame"], align="top")
-        widget["mark"] = number_mark
-        self.number_widgets_en[key] = widget
+        self.highlight_en.apply(key, start_index, word_end)
 
-    def _remove_entry_highlight(self, key: str, entry: WordEntry):
-        marks = self.entry_marks_en.pop(key, None)
-        if marks:
-            start_mark = marks["start"]
-            end_mark = marks["end"]
-            self.text_en.tag_remove("word_highlight", start_mark, end_mark)
-            self.text_en.mark_unset(start_mark)
-            self.text_en.mark_unset(end_mark)
-        self._remove_number_widget(self.text_en, self.number_widgets_en, key)
-
-    def _create_number_widget(self, widget: tk.Text) -> Dict[str, object]:
-        frame = tk.Frame(widget, bg=HIGHLIGHT_COLOR, highlightthickness=0, bd=0)
-        label = tk.Label(
-            frame,
-            text="",
-            bg=HIGHLIGHT_COLOR,
-            fg="#000000",
-            padx=0,
-            pady=0,
-            anchor="nw",
-        )
-        label.place(x=0, y=0, anchor="nw")
-        bundle = {"frame": frame, "label": label, "widget": widget}
-        self._style_number_widget(bundle)
-        return bundle
-
-    def _style_number_widget(self, bundle: Dict[str, object]):
-        widget: tk.Text = bundle["widget"]  # type: ignore[assignment]
-        frame: tk.Frame = bundle["frame"]  # type: ignore[assignment]
-        label: tk.Label = bundle["label"]  # type: ignore[assignment]
-        text_font = tkfont.Font(font=widget["font"])
-        line_height = text_font.metrics("linespace")
-        number_font_size = max(8, int(self.font_size / 3))
-        label.config(font=("Segoe UI", number_font_size, "bold"))
-        width = max(12, text_font.measure("0") + 2)
-        frame.config(width=width, height=line_height, bg=HIGHLIGHT_COLOR)
-        frame.pack_propagate(False)
-
-    def _refresh_number_widgets(self):
-        for bundle in list(self.number_widgets_en.values()):
-            self._style_number_widget(bundle)
-        for bundle in list(self.number_widgets_vi.values()):
-            self._style_number_widget(bundle)
-
-    def _remove_number_widget(self, widget: tk.Text, store: Dict[str, Dict[str, object]], key: str):
-        bundle = store.pop(key, None)
-        if not bundle:
-            return
-        mark = bundle.get("mark")
-        if mark:
-            try:
-                widget.delete(mark)
-            except tk.TclError:
-                pass
-            widget.mark_unset(mark)
-        frame = bundle.get("frame")
-        if isinstance(frame, tk.Widget):
-            frame.destroy()
-
-    def _clear_number_widgets(self, widget: tk.Text, store: Dict[str, Dict[str, object]]):
-        for key in list(store.keys()):
-            self._remove_number_widget(widget, store, key)
-        store.clear()
+    def _remove_entry_highlight(self, key: str):
+        self.highlight_en.remove(key)
 
     def _reapply_highlights_en(self):
-        self.text_en.tag_remove("word_highlight", "1.0", "end")
-        for marks in self.entry_marks_en.values():
-            self.text_en.mark_unset(marks["start"])
-            self.text_en.mark_unset(marks["end"])
-        self.entry_marks_en.clear()
-        self._clear_number_widgets(self.text_en, self.number_widgets_en)
-        for key in sorted(self.entries.keys(), key=lambda k: self.entries[k].offsets[0]["abs_start"] if self.entries[k].offsets else 10**9):
+        self.highlight_en.clear_all()
+        for key in sorted(
+            self.entries.keys(),
+            key=lambda k: self.entries[k].offsets[0]["abs_start"] if self.entries[k].offsets else 10**9,
+        ):
             self._apply_entry_highlight(key, self.entries[key])
         self._update_entry_numbers()
 
     def _update_entry_numbers(self):
         sorted_entries = self._entries_sorted_by_offset()
-        order_map = {self._entry_key(entry.display, entry.context_sentence): idx for idx, entry in enumerate(sorted_entries, start=1)}
-        for key, bundle in self.number_widgets_en.items():
-            number = order_map.get(key, "")
-            label: tk.Label = bundle["label"]  # type: ignore[assignment]
-            label.config(text=str(number) if number else "")
-            frame: tk.Frame = bundle["frame"]  # type: ignore[assignment]
-            frame.config(bg=HIGHLIGHT_COLOR)
-            label.config(bg=HIGHLIGHT_COLOR)
-        for key, bundle in self.number_widgets_vi.items():
-            number = order_map.get(key, "")
-            label: tk.Label = bundle["label"]  # type: ignore[assignment]
-            label.config(text=str(number) if number else "")
-            frame: tk.Frame = bundle["frame"]  # type: ignore[assignment]
-            frame.config(bg=HIGHLIGHT_COLOR)
-            label.config(bg=HIGHLIGHT_COLOR)
+        order_map = {
+            self._entry_key(entry.display, entry.context_sentence): idx
+            for idx, entry in enumerate(sorted_entries, start=1)
+        }
+        self.highlight_en.update_numbers(order_map)
+        self.highlight_vi.update_numbers(order_map)
 
     def _on_left_tab_changed(self, _event):
         tab = self.nb_left.nametowidget(self.nb_left.select())
@@ -834,15 +1081,10 @@ class VocabReaderApp(tk.Tk):
         self._update_vietsub_highlights()
 
     def _clear_vietsub_state(self):
-        self.text_vi.tag_remove("word_highlight", "1.0", "end")
-        for marks in self.entry_marks_vi.values():
-            self.text_vi.mark_unset(marks["start"])
-            self.text_vi.mark_unset(marks["end"])
-        self.entry_marks_vi.clear()
-        self._clear_number_widgets(self.text_vi, self.number_widgets_vi)
+        self.highlight_vi.clear_all()
 
     def _update_vietsub_highlights(self):
-        self._clear_vietsub_state()
+        self.highlight_vi.clear_all()
         content = self.text_vi.get("1.0", "end-1c")
         if not content.strip():
             return
@@ -856,21 +1098,7 @@ class VocabReaderApp(tk.Tk):
             if not start:
                 continue
             end = self.text_vi.index(f"{start}+{len(meaning)}c")
-            self.text_vi.tag_add("word_highlight", start, end)
-            start_mark = f"vi_start_{key}"
-            end_mark = f"vi_end_{key}"
-            self.text_vi.mark_set(start_mark, start)
-            self.text_vi.mark_set(end_mark, end)
-            self.text_vi.mark_gravity(start_mark, tk.LEFT)
-            self.text_vi.mark_gravity(end_mark, tk.LEFT)
-            self.entry_marks_vi[key] = {"start": start_mark, "end": end_mark}
-            number_mark = f"number_vi_{key}"
-            self.text_vi.mark_set(number_mark, start)
-            self.text_vi.mark_gravity(number_mark, tk.LEFT)
-            widget = self._create_number_widget(self.text_vi)
-            self.text_vi.window_create(number_mark, window=widget["frame"], align="top")
-            widget["mark"] = number_mark
-            self.number_widgets_vi[key] = widget
+            self.highlight_vi.apply(key, start, end)
         self._update_entry_numbers()
 
     def _get_current_sentence(self, full_text: str):
