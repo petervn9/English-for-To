@@ -91,6 +91,7 @@ class VocabReaderApp(tk.Tk):
         self._active_tree_column: str | None = None
         self._tree_highlight_after: str | None = None
         self._tree_highlight_auto_clear = False
+        self._tree_highlight_started_at: float = 0.0
         self._build_ui()
         self._bind_keys()
         self._apply_theme()
@@ -799,8 +800,10 @@ class VocabReaderApp(tk.Tk):
         self._active_tree_column = column_name
         self._tree_highlight_auto_clear = auto_clear
         if auto_clear:
+            self._tree_highlight_started_at = time.monotonic()
             self._schedule_tree_highlight_clear()
         else:
+            self._tree_highlight_started_at = 0.0
             if self._tree_highlight_after:
                 try:
                     self.after_cancel(self._tree_highlight_after)
@@ -824,6 +827,7 @@ class VocabReaderApp(tk.Tk):
         self._active_tree_tag = None
         self._active_tree_column = None
         self._tree_highlight_auto_clear = False
+        self._tree_highlight_started_at = 0.0
 
     def _tree_column_name(self, column: str) -> str:
         columns = list(self.tree["columns"])
@@ -895,7 +899,20 @@ class VocabReaderApp(tk.Tk):
         if not self._active_tree_item or not self._tree_highlight_auto_clear:
             self._tree_highlight_after = None
             return
-        self._tree_highlight_after = self.after(TREE_HIGHLIGHT_TIMEOUT_MS, self._clear_tree_highlight)
+
+        timeout_seconds = TREE_HIGHLIGHT_TIMEOUT_MS / 1000.0
+
+        def _poll():
+            self._tree_highlight_after = None
+            if not self._active_tree_item or not self._tree_highlight_auto_clear:
+                return
+            elapsed = time.monotonic() - self._tree_highlight_started_at
+            if not pygame.mixer.get_busy() or elapsed >= timeout_seconds:
+                self._clear_tree_highlight()
+                return
+            self._schedule_tree_highlight_clear()
+
+        self._tree_highlight_after = self.after(120, _poll)
 
     def _apply_entry_highlight(self, key: str, entry: WordEntry):
         full_text = self.text_en.get("1.0", "end-1c")
