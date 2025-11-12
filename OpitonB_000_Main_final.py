@@ -169,6 +169,7 @@ class VocabReaderApp(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<ButtonPress-1>", self._on_tree_button_press)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_button_release)
+        self.tree.bind("<FocusOut>", lambda _e: self._clear_tree_highlight())
         dict_toolbar = ttk.Frame(self.tab_dict)
         dict_toolbar.pack(fill="x")
         ttk.Button(dict_toolbar, text="Phát âm", command=self.speak_selected_word).pack(side="left", padx=4, pady=4)
@@ -685,10 +686,11 @@ class VocabReaderApp(tk.Tk):
             messagebox.showerror("TTS", str(exc))
 
     def _on_tree_select(self, _event):
-        if self._suppress_lemma_speak:
-            return
         selection = self.tree.selection()
         if not selection:
+            self._clear_tree_highlight()
+            return
+        if self._suppress_lemma_speak:
             return
         key = selection[0]
         entry = self.entries.get(key)
@@ -789,6 +791,16 @@ class VocabReaderApp(tk.Tk):
             return
         tag = self._ensure_tree_highlight_tag(column_name, color)
         if self._active_tree_item == item and self._active_tree_tag == tag:
+            self._tree_highlight_auto_clear = auto_clear
+            if auto_clear:
+                self._tree_highlight_started_at = time.monotonic()
+                self._schedule_tree_highlight_clear()
+            elif self._tree_highlight_after:
+                try:
+                    self.after_cancel(self._tree_highlight_after)
+                except tk.TclError:
+                    pass
+                self._tree_highlight_after = None
             return
         self._clear_tree_highlight()
         tags = list(self.tree.item(item, "tags") or [])
