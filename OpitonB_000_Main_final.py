@@ -84,14 +84,7 @@ class VocabReaderApp(tk.Tk):
         self._suppress_lemma_speak = False
         self._pending_context_item = None
         self._suppress_reset_after: str | None = None
-        self._tree_cell_tag_supported: bool | None = None
-        self._tree_cell_tags: Dict[Tuple[str, str], str] = {}
-        self._active_tree_item: str | None = None
-        self._active_tree_tag: str | None = None
-        self._active_tree_column: str | None = None
-        self._tree_highlight_after: str | None = None
-        self._tree_highlight_auto_clear = False
-        self._tree_highlight_started_at: float = 0.0
+        self._tree_overlays: Dict[str, Dict[str, object] | None] = {"lemma": None, "context": None}
         self._build_ui()
         self._bind_keys()
         self._apply_theme()
@@ -169,10 +162,15 @@ class VocabReaderApp(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<ButtonPress-1>", self._on_tree_button_press)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_button_release)
-        self.tree.bind("<Configure>", lambda _e: self._update_tree_highlight_styles())
-        self.tree.bind("<Map>", lambda _e: self._update_tree_highlight_styles())
-        self.tree.bind("<Unmap>", lambda _e: self._clear_tree_highlight())
-        self.tree.bind("<FocusOut>", lambda _e: self._clear_tree_highlight())
+        self.tree.bind("<Configure>", lambda _e: self._update_tree_overlay_positions())
+        self.tree.bind("<Map>", lambda _e: self._update_tree_overlay_positions())
+        self.tree.bind("<Unmap>", lambda _e: self._clear_all_tree_overlays())
+        self.tree.bind("<FocusOut>", lambda _e: self._clear_all_tree_overlays())
+        self.tree.bind("<KeyRelease>", lambda _e: self._update_tree_overlay_positions())
+        self.tree.bind("<MouseWheel>", lambda _e: self.after_idle(self._update_tree_overlay_positions()))
+        self.tree.bind("<Shift-MouseWheel>", lambda _e: self.after_idle(self._update_tree_overlay_positions()))
+        self.tree.bind("<Button-4>", lambda _e: self.after_idle(self._update_tree_overlay_positions()))
+        self.tree.bind("<Button-5>", lambda _e: self.after_idle(self._update_tree_overlay_positions()))
         dict_toolbar = ttk.Frame(self.tab_dict)
         dict_toolbar.pack(fill="x")
         ttk.Button(dict_toolbar, text="Phát âm", command=self.speak_selected_word).pack(side="left", padx=4, pady=4)
@@ -223,7 +221,8 @@ class VocabReaderApp(tk.Tk):
                 selectforeground="#000000",
             )
         self._configure_tree_style()
-        self._update_tree_highlight_styles()
+        self._refresh_tree_overlay_styles()
+        self._update_tree_overlay_positions()
         self._refresh_number_widgets()
 
     def _configure_tree_style(self):
@@ -265,6 +264,7 @@ class VocabReaderApp(tk.Tk):
         self.entry_marks_vi.clear()
         self._clear_number_widgets(self.text_en, self.number_widgets_en)
         self._clear_number_widgets(self.text_vi, self.number_widgets_vi)
+        self._clear_all_tree_overlays()
         self.tree.delete(*self.tree.get_children())
         self.title(f"{APP_TITLE} – {os.path.basename(path)}")
         self.text_vi.delete("1.0", "end")
@@ -324,6 +324,7 @@ class VocabReaderApp(tk.Tk):
         self.entry_marks_vi.clear()
         self._clear_number_widgets(self.text_en, self.number_widgets_en)
         self._clear_number_widgets(self.text_vi, self.number_widgets_vi)
+        self._clear_all_tree_overlays()
         self.tree.delete(*self.tree.get_children())
         for entry_data in data.get("entries", []):
             offsets = entry_data.get("offsets") or []
@@ -506,6 +507,8 @@ class VocabReaderApp(tk.Tk):
         self.text_en.config(font=("Segoe UI", self.font_size))
         self.text_vi.config(font=("Segoe UI", self.font_size))
         self._configure_tree_style()
+        self._refresh_tree_overlay_styles()
+        self._update_tree_overlay_positions()
         self._refresh_number_widgets()
 
     def _find_paragraph(self, full_text: str, start: int, end: int) -> str:
@@ -691,7 +694,7 @@ class VocabReaderApp(tk.Tk):
     def _on_tree_select(self, _event):
         selection = self.tree.selection()
         if not selection:
-            self._clear_tree_highlight()
+            self._clear_tree_overlay("lemma")
             return
         if self._suppress_lemma_speak:
             return
@@ -699,7 +702,7 @@ class VocabReaderApp(tk.Tk):
         entry = self.entries.get(key)
         if entry:
             self._speak_entry_text(entry, use_surface=False)
-            self._apply_tree_highlight(key, "Word", LEMMA_CELL_COLOR, auto_clear=True)
+            self._apply_tree_overlay("lemma", key, "Word", LEMMA_CELL_COLOR, auto_clear=True)
 
     def _on_tree_button_press(self, event):
         column = self.tree.identify_column(event.x)
@@ -723,14 +726,14 @@ class VocabReaderApp(tk.Tk):
                     pass
                 self._suppress_reset_after = None
             if not row:
-                self._clear_tree_highlight()
+                self._clear_all_tree_overlays()
 
     def _on_tree_button_release(self, _event):
         if self._pending_context_item:
             entry = self.entries.get(self._pending_context_item)
             if entry:
                 self._speak_entry_text(entry, use_surface=True)
-                self._apply_tree_highlight(self._pending_context_item, "No.", CONTEXT_CELL_COLOR, auto_clear=True)
+                self._apply_tree_overlay("context", self._pending_context_item, "No.", CONTEXT_CELL_COLOR, auto_clear=True)
             if self._suppress_reset_after:
                 try:
                     self.after_cancel(self._suppress_reset_after)
@@ -757,8 +760,11 @@ class VocabReaderApp(tk.Tk):
         self.tree.delete(key)
         self._update_vietsub_highlights()
         self._update_entry_numbers()
-        if key == self._active_tree_item:
-            self._clear_tree_highlight()
+        if key in {
+            self._current_overlay_item("lemma"),
+            self._current_overlay_item("context"),
+        }:
+            self._clear_all_tree_overlays()
 
     def _entries_sorted_by_offset(self) -> List[WordEntry]:
         def key_fn(entry: WordEntry) -> Tuple[int, int]:
@@ -785,64 +791,7 @@ class VocabReaderApp(tk.Tk):
             key = self._entry_key(entry.display, entry.context_sentence)
             values = [index, entry.display, entry.pos, entry.vi_meaning]
             self.tree.insert("", "end", iid=key, values=values)
-        self._clear_tree_highlight()
-
-    def _apply_tree_highlight(self, item: str, column: str, color: str, *, auto_clear: bool = False):
-        column_name = self._tree_column_name(column)
-        if not column_name or not self.tree.exists(item):
-            self._clear_tree_highlight()
-            return
-        tag = self._ensure_tree_highlight_tag(column_name, color)
-        if self._active_tree_item == item and self._active_tree_tag == tag:
-            self._tree_highlight_auto_clear = auto_clear
-            if auto_clear:
-                self._tree_highlight_started_at = time.monotonic()
-                self._schedule_tree_highlight_clear()
-            elif self._tree_highlight_after:
-                try:
-                    self.after_cancel(self._tree_highlight_after)
-                except tk.TclError:
-                    pass
-                self._tree_highlight_after = None
-            return
-        self._clear_tree_highlight()
-        tags = list(self.tree.item(item, "tags") or [])
-        if tag not in tags:
-            tags.append(tag)
-        self.tree.item(item, tags=tuple(tags))
-        self._active_tree_item = item
-        self._active_tree_tag = tag
-        self._active_tree_column = column_name
-        self._tree_highlight_auto_clear = auto_clear
-        if auto_clear:
-            self._tree_highlight_started_at = time.monotonic()
-            self._schedule_tree_highlight_clear()
-        else:
-            self._tree_highlight_started_at = 0.0
-            if self._tree_highlight_after:
-                try:
-                    self.after_cancel(self._tree_highlight_after)
-                except tk.TclError:
-                    pass
-                self._tree_highlight_after = None
-
-    def _clear_tree_highlight(self):
-        if self._tree_highlight_after:
-            try:
-                self.after_cancel(self._tree_highlight_after)
-            except tk.TclError:
-                pass
-            self._tree_highlight_after = None
-        if self._active_tree_item and self._active_tree_tag and self.tree.exists(self._active_tree_item):
-            tags = list(self.tree.item(self._active_tree_item, "tags") or [])
-            if self._active_tree_tag in tags:
-                tags.remove(self._active_tree_tag)
-                self.tree.item(self._active_tree_item, tags=tuple(tags))
-        self._active_tree_item = None
-        self._active_tree_tag = None
-        self._active_tree_column = None
-        self._tree_highlight_auto_clear = False
-        self._tree_highlight_started_at = 0.0
+        self._clear_all_tree_overlays()
 
     def _tree_column_name(self, column: str) -> str:
         columns = list(self.tree["columns"])
@@ -857,77 +806,142 @@ class VocabReaderApp(tk.Tk):
                 return columns[index]
         return ""
 
-    def _ensure_tree_highlight_tag(self, column_name: str, color: str) -> str:
-        key = (column_name, color)
-        tag = self._tree_cell_tags.get(key)
-        if tag:
-            self._configure_tree_highlight_tag(column_name, color, tag)
-            return tag
-        tag = f"tree_highlight_{len(self._tree_cell_tags)}"
-        self._tree_cell_tags[key] = tag
-        self._configure_tree_highlight_tag(column_name, color, tag)
-        return tag
-
-    def _configure_tree_highlight_tag(self, column_name: str, bg_color: str, tag: str):
-        colors = THEMES[self.theme]
-        text_color = colors["text_fg"]
-        if self._tree_cell_tag_supported is False:
-            self.tree.tag_configure(tag, background=bg_color, foreground=text_color)
+    def _apply_tree_overlay(self, kind: str, item: str, column: str, color: str, *, auto_clear: bool = False):
+        column_name = self._tree_column_name(column)
+        if not column_name or not self.tree.exists(item):
+            self._clear_tree_overlay(kind)
             return
+        self._clear_all_tree_overlays()
+        columns = list(self.tree["columns"])
         try:
-            self.tree.tk.call(self.tree, "tag", "configure", tag, "-cellbackground", column_name, bg_color)
-            self.tree.tk.call(self.tree, "tag", "configure", tag, "-cellforeground", column_name, text_color)
-            self._tree_cell_tag_supported = True
-        except tk.TclError:
-            self._tree_cell_tag_supported = False
-            self.tree.tag_configure(tag, background=bg_color, foreground=text_color)
-
-    def _update_tree_highlight_styles(self):
-        if not hasattr(self, "tree"):
+            col_index = columns.index(column_name)
+        except ValueError:
             return
-        for (column_name, color), tag in self._tree_cell_tags.items():
-            self._configure_tree_highlight_tag(column_name, color, tag)
-        if self._active_tree_item and self._active_tree_column:
-            item = self._active_tree_item
-            column = self._active_tree_column
-            color = self._current_tree_highlight_color()
-            auto_clear = self._tree_highlight_auto_clear
-            self._active_tree_item = None
-            self._active_tree_tag = None
-            self._active_tree_column = None
-            self._apply_tree_highlight(item, column, color, auto_clear=auto_clear)
+        values = self.tree.item(item, "values") or ()
+        raw_text = values[col_index] if col_index < len(values) else ""
+        text = str(raw_text)
+        anchor = self.tree.column(column_name, "anchor") or "w"
+        anchor = anchor if anchor in {"w", "e", "center"} else "w"
+        frame = tk.Frame(self.tree, bg=color, highlightthickness=0, bd=0)
+        label = tk.Label(
+            frame,
+            text=text,
+            bg=color,
+            fg=THEMES[self.theme]["text_fg"],
+            font=self._tree_body_font(),
+            anchor=anchor,
+            padx=6,
+        )
+        label.pack(fill="both", expand=True)
+        info: Dict[str, object] = {
+            "item": item,
+            "column": column_name,
+            "frame": frame,
+            "label": label,
+            "color": color,
+            "auto_clear": auto_clear,
+            "start": time.monotonic(),
+            "after": None,
+        }
+        self._tree_overlays[kind] = info
+        self._update_tree_overlay_positions()
+        self.after_idle(self._update_tree_overlay_positions)
+        if auto_clear:
+            self._schedule_overlay_poll(kind)
 
-    def _current_tree_highlight_color(self) -> str:
-        if not self._active_tree_tag:
-            return LEMMA_CELL_COLOR
-        for (_column, color), tag in self._tree_cell_tags.items():
-            if tag == self._active_tree_tag:
-                return color
-        return LEMMA_CELL_COLOR
+    def _tree_body_font(self):
+        return ("Segoe UI", self.font_size)
 
-    def _schedule_tree_highlight_clear(self):
-        if self._tree_highlight_after:
+    def _clear_tree_overlay(self, kind: str):
+        info = self._tree_overlays.get(kind)
+        if not info:
+            return
+        after_id = info.get("after")
+        if after_id:
             try:
-                self.after_cancel(self._tree_highlight_after)
+                self.after_cancel(after_id)
             except tk.TclError:
                 pass
-        if not self._active_tree_item or not self._tree_highlight_auto_clear:
-            self._tree_highlight_after = None
+        frame = info.get("frame")
+        if isinstance(frame, tk.Widget):
+            frame.place_forget()
+            frame.destroy()
+        self._tree_overlays[kind] = None
+
+    def _clear_all_tree_overlays(self):
+        for key in list(self._tree_overlays.keys()):
+            self._clear_tree_overlay(key)
+
+    def _current_overlay_item(self, kind: str) -> str | None:
+        info = self._tree_overlays.get(kind)
+        if not info:
+            return None
+        item = info.get("item")
+        return item if isinstance(item, str) else None
+
+    def _update_tree_overlay_positions(self):
+        for kind, info in list(self._tree_overlays.items()):
+            if not info:
+                continue
+            item = info.get("item")
+            column = info.get("column")
+            frame = info.get("frame")
+            if not isinstance(frame, tk.Widget) or not isinstance(item, str) or not isinstance(column, str):
+                self._clear_tree_overlay(kind)
+                continue
+            if not self.tree.exists(item):
+                self._clear_tree_overlay(kind)
+                continue
+            bbox = self.tree.bbox(item, column)
+            if not bbox:
+                frame.place_forget()
+                continue
+            x, y, width, height = bbox
+            frame.place(x=x, y=y, width=width, height=height)
+            frame.lift()
+
+    def _refresh_tree_overlay_styles(self):
+        text_color = THEMES[self.theme]["text_fg"]
+        font = self._tree_body_font()
+        for kind, info in list(self._tree_overlays.items()):
+            if not info:
+                continue
+            frame = info.get("frame")
+            label = info.get("label")
+            color = info.get("color")
+            if not isinstance(frame, tk.Widget) or not isinstance(label, tk.Widget) or not isinstance(color, str):
+                self._clear_tree_overlay(kind)
+                continue
+            frame.configure(bg=color)
+            label.configure(bg=color, fg=text_color, font=font)
+        self._update_tree_overlay_positions()
+
+    def _schedule_overlay_poll(self, kind: str):
+        info = self._tree_overlays.get(kind)
+        if not info:
             return
+        after_id = info.get("after")
+        if after_id:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
 
         timeout_seconds = TREE_HIGHLIGHT_TIMEOUT_MS / 1000.0
 
         def _poll():
-            self._tree_highlight_after = None
-            if not self._active_tree_item or not self._tree_highlight_auto_clear:
+            current = self._tree_overlays.get(kind)
+            if not current:
                 return
-            elapsed = time.monotonic() - self._tree_highlight_started_at
+            current["after"] = None
+            started = current.get("start")
+            elapsed = time.monotonic() - float(started) if started is not None else timeout_seconds
             if not pygame.mixer.get_busy() or elapsed >= timeout_seconds:
-                self._clear_tree_highlight()
+                self._clear_tree_overlay(kind)
                 return
-            self._schedule_tree_highlight_clear()
+            self._schedule_overlay_poll(kind)
 
-        self._tree_highlight_after = self.after(120, _poll)
+        info["after"] = self.after(120, _poll)
 
     def _apply_entry_highlight(self, key: str, entry: WordEntry):
         full_text = self.text_en.get("1.0", "end-1c")
